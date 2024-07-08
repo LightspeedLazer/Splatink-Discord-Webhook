@@ -5,7 +5,7 @@ mod error;
 extern crate serde;
 extern crate chrono;
 
-use std::{env, fmt::Display, fs, path::Path};
+use std::{env, fmt::Display, fs, path::Path, future::Future};
 
 use chrono::{DateTime, Utc};
 use error::{Error, Result};
@@ -403,6 +403,7 @@ async fn send_notifications(reqwest_client: &Client, notifications: &[Notificati
                 Err(err) => break Err(err),
             }
         }
+        .inspect_err(|err| eprintln!("Sending Err: {err}"))
     })
     .map(Box::pin)
     .collect();
@@ -414,6 +415,22 @@ async fn send_notifications(reqwest_client: &Client, notifications: &[Notificati
             _ => {},
         }
         results.push(res);
+        futures = remaining;
+    }
+    results
+}
+
+async fn collect_futures<O, I>(iter: I) -> O
+where
+    I: IntoIterator,
+    I::Item: Future + Unpin,
+    O: Default + Extend<<I::Item as Future>::Output>,
+{
+    let mut futures: Vec<_> = iter.into_iter().map(Box::pin).collect();
+    let mut results = O::default();
+    while !futures.is_empty() {
+        let (res, _, remaining) = futures::future::select_all(futures).await;
+        results.extend(std::iter::once(res));
         futures = remaining;
     }
     results
