@@ -63,6 +63,7 @@ impl From<DiscordError> for Error {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 pub struct DiscordError {
     pub message: String,

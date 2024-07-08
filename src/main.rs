@@ -389,7 +389,7 @@ async fn get_splatfest_notifications(reqwest_client: &Client) -> Result<Vec<Noti
 }
 
 async fn send_notifications(reqwest_client: &Client, notifications: &[Notification]) -> Vec<Result<()>> {
-    let mut futures: Vec<_> = notifications.into_iter().map(|notif| async move {
+    collect_futures(notifications.into_iter().map(|notif| async move {
         let mut message = Message::new();
         notif.setup_message(&mut message);
         println!("{notif}");
@@ -404,26 +404,14 @@ async fn send_notifications(reqwest_client: &Client, notifications: &[Notificati
             }
         }
         .inspect_err(|err| eprintln!("Sending Err: {err}"))
-    })
-    .map(Box::pin)
-    .collect();
-    let mut results = Vec::with_capacity(futures.len());
-    while !futures.is_empty() {
-        let (res, _, remaining) = futures::future::select_all(futures).await;
-        match &res {
-            Err(err) => eprintln!("Sending Err: {err}"),
-            _ => {},
-        }
-        results.push(res);
-        futures = remaining;
-    }
-    results
+    }))
+    .await
 }
 
 async fn collect_futures<O, I>(iter: I) -> O
 where
     I: IntoIterator,
-    I::Item: Future + Unpin,
+    I::Item: Future,
     O: Default + Extend<<I::Item as Future>::Output>,
 {
     let mut futures: Vec<_> = iter.into_iter().map(Box::pin).collect();
