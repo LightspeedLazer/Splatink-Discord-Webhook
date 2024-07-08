@@ -5,7 +5,7 @@ mod error;
 extern crate serde;
 extern crate chrono;
 
-use std::{env, fs, path::Path};
+use std::{env, fmt::Display, fs, path::Path};
 
 use chrono::{DateTime, Utc};
 use error::{Error, Result};
@@ -30,29 +30,11 @@ async fn main() -> Result<()> {
         .build()?
     ;
     let (schedules, splatfests) = join!(
-        get_salmon_run_notifications(&reqwest_client),
-        get_splatfest_notification(&reqwest_client),
+        async {Ok::<_, Error>(send_notifications(&reqwest_client, &get_salmon_run_notifications(&reqwest_client).await?).await)},
+        async {Ok::<_, Error>(send_notifications(&reqwest_client, &get_splatfest_notifications(&reqwest_client).await?).await)},
     );
-    let notifications = schedules?.into_iter().chain(splatfests?);
-    for notif in notifications {
-        let mut message = Message::new();
-        notif.setup_message(&mut message);
-        println!("{notif:?}");
-        let result = async {loop {
-            match send_message(&reqwest_client, &message).await {
-                Ok(b) => break Ok(b),
-                Err(Error::Discord(err)) => {
-                    async_std::task::sleep(std::time::Duration::from_secs_f64(err.retry_after)).await;
-                    continue;
-                },
-                Err(err) => break Err(err),
-            }
-        }}.await;
-        match result {
-            Ok(_) => {},
-            Err(err) => eprintln!("Notif err: {err}")
-        }
-    }
+    let (ok, err) = schedules?.into_iter().chain(splatfests?).partition::<Vec<_>,_>(|res| res.is_ok());
+    println!("Notifs sent: {} | Notifs failed: {}", ok.len(), err.len());
     Ok(())
 }
 
@@ -264,6 +246,22 @@ impl Notification {
     }
 }
 
+impl Display for Notification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Notification::Splatfest{title, ..} => write!(f, "Splatfest: {title}"),
+            Notification::BigRun{stage, ..} => write!(f, "Big Run on {}", stage.0),
+            Notification::EggstraWork{stage, ..} => write!(f, "Eggstra Work on {}", stage.0),
+            Notification::Random{stage, weapons, ..} => match weapons.len() {
+                0 | 1 => write!(f, "Random Rotation on {}", stage.0),
+                2 | 3 => write!(f, "Random Rotation on {}", stage.0),
+                _ => write!(f, "Random Rotation on {}", stage.0),
+            },
+            Notification::Golden{stage, ..} => write!(f, "Golden Rotation on {}", stage.0),
+        }
+    }
+}
+
 async fn fetch_json<U: IntoUrl, T: de::DeserializeOwned>(reqwest_client: &Client, url: U) -> Result<T> {
     let json = reqwest_client
         .get(url)
@@ -372,7 +370,7 @@ async fn get_salmon_run_notifications(reqwest_client: &Client) -> Result<Vec<Not
     Ok(regular_notifications.chain(big_run_notifications).chain(eggstra_work_schedule).collect())
 }
 
-async fn get_splatfest_notification(reqwest_client: &Client) -> Result<Vec<Notification>> {
+async fn get_splatfest_notifications(reqwest_client: &Client) -> Result<Vec<Notification>> {
     let (internet_data, file_data) = get_data::<SplatfestData,_,_>(reqwest_client, SPLATFEST_URL, "Splatfest Json.json").await?;
     let splatfest_notifications = 
         internet_data.US.data.festRecords.nodes.into_iter().take_while(|internet_fest| file_data.US.data.festRecords.nodes.iter().all(|file_fest| internet_fest != file_fest))
@@ -390,16 +388,48 @@ async fn get_splatfest_notification(reqwest_client: &Client) -> Result<Vec<Notif
     Ok(splatfest_notifications.collect())
 }
 
-async fn send_message(reqwest_client: &Client, message: &Message) -> Result<bool> {
+async fn send_notifications(reqwest_client: &Client, notifications: &[Notification]) -> Vec<Result<()>> {
+    let mut futures: Vec<_> = notifications.into_iter().map(|notif| async move {
+        let mut message = Message::new();
+        notif.setup_message(&mut message);
+        println!("{notif}");
+        loop {
+            match send_message(&reqwest_client, &message).await {
+                Ok(b) => break Ok(b),
+                Err(Error::Discord(err)) => {
+                    async_std::task::sleep(std::time::Duration::from_secs_f64(err.retry_after)).await;
+                    continue;
+                },
+                Err(err) => break Err(err),
+            }
+        }
+    })
+    .map(Box::pin)
+    .collect();
+    let mut results = Vec::with_capacity(futures.len());
+    while !futures.is_empty() {
+        let (res, _, remaining) = futures::future::select_all(futures).await;
+        match &res {
+            Err(err) => eprintln!("Sending Err: {err}"),
+            _ => {},
+        }
+        results.push(res);
+        futures = remaining;
+    }
+    results
+}
+
+async fn send_message(reqwest_client: &Client, message: &Message) -> Result<()> {
     let body = serde_json::to_string(message)?;
     let response = reqwest_client
         .post(DISCORD_WEBHOOK_URL)
         .header("content-type", "application/json")
         .body(Body::from(body))
-        .send().await?
+        .send()
+        .await?
     ;
     if response.status() == StatusCode::NO_CONTENT {
-        Ok(true)
+        Ok(())
     } else {
         let body_bytes = response.bytes().await?;
         let err_msg = String::from_utf8(body_bytes.to_vec())?;
